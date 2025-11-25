@@ -6,6 +6,7 @@ import ProcessingPipeline from './components/ProcessingPipeline';
 import ScoreViewer from './components/ScoreViewer';
 import AudioPlayer from './components/AudioPlayer';
 import { generateDrumCoachAdvice } from './services/geminiService';
+import * as api from './services/apiService';
 
 function App() {
   const [url, setUrl] = useState('');
@@ -15,70 +16,92 @@ function App() {
   );
   const [result, setResult] = useState<TranscriptionResult | null>(null);
   const [coachTip, setCoachTip] = useState<string | null>(null);
+  const [taskId, setTaskId] = useState<string | null>(null);
 
-  // Simulation of the backend pipeline
+  // Real backend pipeline integration
   const startProcessing = async () => {
     if (!url.trim()) {
       alert('Please enter a YouTube URL to start.');
       return;
     }
-    
+
     // Reset state
     setResult(null);
     setCoachTip(null);
     setSteps(PROCESSING_STEPS_TEMPLATE.map(s => ({ ...s, status: 'pending' })));
-
     setStatus(ProcessStatus.DOWNLOADING);
-    updateStepStatus('download', 'active');
 
-    // 1. Simulate Download (yt-dlp)
-    setTimeout(() => {
-      updateStepStatus('download', 'completed');
-      setStatus(ProcessStatus.SEPARATING);
-      updateStepStatus('separate', 'active');
-      
-      // 2. Simulate Separation (Demucs)
-      setTimeout(() => {
-        updateStepStatus('separate', 'completed');
-        setStatus(ProcessStatus.TRANSCRIBING);
-        updateStepStatus('transcribe', 'active');
-        
-        // 3. Simulate Transcription (Omnizart)
-        setTimeout(() => {
-          updateStepStatus('transcribe', 'completed');
-          setStatus(ProcessStatus.RENDERING);
-          updateStepStatus('render', 'active');
-          
-          // 4. Simulate Rendering & Gemini
-          setTimeout(async () => {
-            updateStepStatus('render', 'completed');
-            setStatus(ProcessStatus.COMPLETE);
-            
-            // Mock Result based on standard rock song structure
-            const mockMeta: SongMetadata = {
-              title: "Neon Groove",
-              artist: "Synthwave Collective",
-              duration: "3:45",
-              bpm: 120,
-              difficulty: "Intermediate",
-              youtubeId: "dQw4w9WgXcQ"
-            };
-            
-            setResult({
-              metadata: mockMeta,
-              musicXml: MOCK_DRUM_XML,
-              drumAudioUrl: '#',
-              originalAudioUrl: '#'
-            });
+    try {
+      // 1. Start processing
+      const processResponse = await api.startProcessing(url);
+      const currentTaskId = processResponse.task_id;
+      setTaskId(currentTaskId);
 
-            // Call Gemini Service
-            const tip = await generateDrumCoachAdvice(mockMeta.title, mockMeta.artist, mockMeta.difficulty);
-            setCoachTip(tip);
+      // 2. Poll for status updates
+      await api.pollTaskStatus(
+        currentTaskId,
+        (taskStatus) => {
+          // Update UI based on task status
+          if (taskStatus.status === 'DOWNLOADING') {
+            setStatus(ProcessStatus.DOWNLOADING);
+            updateStepStatus('download', 'active');
+          } else if (taskStatus.status === 'SEPARATING') {
+            updateStepStatus('download', 'completed');
+            setStatus(ProcessStatus.SEPARATING);
+            updateStepStatus('separate', 'active');
+          } else if (taskStatus.status === 'TRANSCRIBING') {
+            updateStepStatus('separate', 'completed');
+            setStatus(ProcessStatus.TRANSCRIBING);
+            updateStepStatus('transcribe', 'active');
+          } else if (taskStatus.status === 'RENDERING') {
+            updateStepStatus('transcribe', 'completed');
+            setStatus(ProcessStatus.RENDERING);
+            updateStepStatus('render', 'active');
+          }
+        },
+        2000 // Poll every 2 seconds
+      );
 
-          }, 1200);
-        }, 2500);
-      }, 3000); // Heavy model takes longer
-    }, 1500);
+      // 3. Get final result
+      updateStepStatus('render', 'completed');
+      setStatus(ProcessStatus.COMPLETE);
+
+      const apiResult = await api.getResult(currentTaskId);
+
+      // Extract YouTube ID from URL
+      const youtubeIdMatch = url.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|v\/))([^&\?\/]+)/);
+      const youtubeId = youtubeIdMatch ? youtubeIdMatch[1] : '';
+
+      // Format result for UI
+      const metadata: SongMetadata = {
+        title: apiResult.metadata.title || "Transcribed Song",
+        artist: apiResult.metadata.artist || "Unknown Artist",
+        duration: apiResult.metadata.duration,
+        bpm: apiResult.metadata.bpm,
+        difficulty: apiResult.metadata.difficulty as any,
+        youtubeId: youtubeId
+      };
+
+      setResult({
+        metadata,
+        musicXml: apiResult.musicxml,
+        drumAudioUrl: api.getDrumAudioUrl(currentTaskId),
+        originalAudioUrl: api.getOriginalAudioUrl(currentTaskId)
+      });
+
+      // Call Gemini Service for coaching tips
+      const tip = await generateDrumCoachAdvice(
+        metadata.title,
+        metadata.artist,
+        metadata.difficulty
+      );
+      setCoachTip(tip);
+
+    } catch (error: any) {
+      console.error('Processing error:', error);
+      setStatus(ProcessStatus.ERROR);
+      alert(`처리 중 오류가 발생했습니다: ${error.message || '알 수 없는 오류'}`);
+    }
   };
 
   const updateStepStatus = (id: string, status: 'pending' | 'active' | 'completed') => {
@@ -91,6 +114,7 @@ function App() {
     setCoachTip(null);
     setSteps(PROCESSING_STEPS_TEMPLATE.map(s => ({ ...s, status: 'pending' })));
     setUrl('');
+    setTaskId(null);
   };
 
   return (
@@ -205,11 +229,17 @@ function App() {
                    <p className="text-brand-400 font-medium">{result.metadata.artist}</p>
                 </div>
                 <div className="flex gap-3">
-                   <button className="flex-1 sm:flex-none px-5 py-2.5 bg-dark-800 hover:bg-dark-700 border border-white/10 rounded-lg text-sm font-medium text-white transition-all hover:border-white/20 flex items-center justify-center gap-2">
+                   <button
+                     onClick={() => taskId && window.open(api.getMIDIDownloadUrl(taskId), '_blank')}
+                     className="flex-1 sm:flex-none px-5 py-2.5 bg-dark-800 hover:bg-dark-700 border border-white/10 rounded-lg text-sm font-medium text-white transition-all hover:border-white/20 flex items-center justify-center gap-2"
+                   >
                      <Download className="w-4 h-4" /> MIDI
                    </button>
-                   <button className="flex-1 sm:flex-none px-5 py-2.5 bg-brand-600 hover:bg-brand-500 rounded-lg text-sm font-medium text-white shadow-lg hover:shadow-brand-500/25 transition-all flex items-center justify-center gap-2">
-                     <Download className="w-4 h-4" /> PDF
+                   <button
+                     onClick={() => taskId && window.open(api.getMusicXMLDownloadUrl(taskId), '_blank')}
+                     className="flex-1 sm:flex-none px-5 py-2.5 bg-brand-600 hover:bg-brand-500 rounded-lg text-sm font-medium text-white shadow-lg hover:shadow-brand-500/25 transition-all flex items-center justify-center gap-2"
+                   >
+                     <Download className="w-4 h-4" /> MusicXML
                    </button>
                 </div>
               </div>
