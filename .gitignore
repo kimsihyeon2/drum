@@ -22,3 +22,27 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+
+# Backend temp files
+backend/temp/
+backend/*.wav
+backend/*.mid
+backend/*.midi
+backend/*.musicxml
+backend/*.pdf
+
+# Model files (Demucs 등)
+.cache/
+models/
+!backend/models/
