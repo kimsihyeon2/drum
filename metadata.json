@@ -1,0 +1,7 @@
+{
+  "name": "GrooveExtract AI",
+  "description": "State-of-the-art drum separation and automatic sheet music generation using Hybrid Transformers.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
