@@ -1,112 +1,125 @@
-"""
-드럼 트랜스크립션 서비스 (basic-pitch 사용)
-"""
 import os
-import logging
-from typing import Tuple, Dict, Any
+import numpy as np
 import librosa
-from basic_pitch.inference import predict_and_save
-from basic_pitch import ICASSP_2022_MODEL_PATH
+import warnings
+from music21 import stream, note, instrument, clef, meter
+from scipy.signal import find_peaks
 
-logger = logging.getLogger(__name__)
+warnings.filterwarnings("ignore")
 
-TEMP_DIR = "backend/temp/transcriptions"
-
-
-async def transcribe_drums(drum_audio_path: str, task_id: str) -> Tuple[str, Dict[str, Any]]:
+async def transcribe_drums(audio_path, output_dir):
     """
-    드럼 오디오를 MIDI로 트랜스크립션
-
-    Args:
-        drum_audio_path: 드럼 오디오 파일 경로
-        task_id: 작업 ID
-
-    Returns:
-        (MIDI 파일 경로, 메타데이터)
+    [Adaptive Sensitivity Version]
+    감지된 노트 수가 너무 적으면 자동으로 감도를 조절하여 재시도합니다.
     """
-    os.makedirs(TEMP_DIR, exist_ok=True)
-
-    output_dir = os.path.join(TEMP_DIR, task_id)
     os.makedirs(output_dir, exist_ok=True)
+    output_xml_path = os.path.join(output_dir, "transcription.musicxml")
+    output_midi_path = os.path.join(output_dir, "transcription.mid")
+
+    print(f"🥁 Transcribing (Adaptive): {audio_path}")
 
     try:
-        logger.info(f"Starting transcription for: {drum_audio_path}")
+        # 1. 오디오 로드
+        y, sr = librosa.load(audio_path, sr=44100)
+        
+        # 정규화 (가장 큰 소리를 1.0으로 맞춤)
+        y = librosa.util.normalize(y)
+        
+        # 타악기 성분 분리
+        _, y_percussive = librosa.effects.hpss(y)
+        
+        # 주파수 대역별 에너지 계산 함수
+        def get_band_energy(y_input, low, high):
+            S = np.abs(librosa.stft(y_input))
+            fft_freqs = librosa.fft_frequencies(sr=sr)
+            bins = np.where((fft_freqs >= low) & (fft_freqs <= high))[0]
+            if len(bins) == 0: return np.zeros(S.shape[1])
+            return librosa.util.normalize(np.mean(S[bins, :], axis=0))
 
-        # basic-pitch로 MIDI 생성
-        predict_and_save(
-            [drum_audio_path],
-            output_dir,
-            save_midi=True,
-            sonify_midi=False,
-            save_model_outputs=False,
-            save_notes=False,
-        )
+        # 2. 대역별 에너지 추출
+        env_kick = get_band_energy(y_percussive, 20, 150)
+        env_snare = get_band_energy(y_percussive, 200, 2500)
+        env_hh = get_band_energy(y_percussive, 5000, 20000)
 
-        # MIDI 파일 경로 찾기
-        midi_filename = os.path.splitext(os.path.basename(drum_audio_path))[0] + "_basic_pitch.mid"
-        midi_path = os.path.join(output_dir, midi_filename)
+        # 3. 적응형 피크 검출 (Adaptive Peak Picking)
+        def adaptive_pick(env, name, min_notes=20):
+            # 처음에는 일반적인 기준(0.15)으로 시도
+            thresholds = [0.15, 0.10, 0.05, 0.02] # 점점 예민해짐
+            
+            for th in thresholds:
+                peaks, _ = find_peaks(env, height=th, distance=sr/16)
+                if len(peaks) >= min_notes:
+                    print(f"  - {name}: Found {len(peaks)} notes (Threshold: {th})")
+                    return peaks
+            
+            # 그래도 없으면 마지막 결과 반환
+            print(f"  - {name}: Found {len(peaks)} notes (Warning: Low count)")
+            return peaks
 
-        if not os.path.exists(midi_path):
-            raise Exception("MIDI 파일 생성에 실패했습니다.")
+        peaks_kick = adaptive_pick(env_kick, "Kick")
+        peaks_snare = adaptive_pick(env_snare, "Snare")
+        peaks_hh = adaptive_pick(env_hh, "Hi-hat", min_notes=50) # 하이햇은 더 많아야 함
 
-        # 메타데이터 분석
-        metadata = await analyze_audio_metadata(drum_audio_path)
+        times_kick = librosa.frames_to_time(peaks_kick, sr=sr)
+        times_snare = librosa.frames_to_time(peaks_snare, sr=sr)
+        times_hh = librosa.frames_to_time(peaks_hh, sr=sr)
 
-        logger.info(f"Transcription complete: {midi_path}")
-        return midi_path, metadata
+        # 4. 악보 생성
+        s = stream.Score()
+        p = stream.Part()
+        p.id = 'DrumPart'
+        p.insert(0, instrument.Percussion())
+        p.insert(0, clef.PercussionClef())
+        p.insert(0, meter.TimeSignature('4/4'))
+
+        # 5. BPM 추정 및 고정
+        try:
+            tempo = librosa.feature.rhythm.tempo(y=y_percussive, sr=sr)[0]
+        except:
+            tempo = librosa.beat.tempo(y=y_percussive, sr=sr)[0]
+            
+        bpm = int(round(tempo))
+        if bpm < 60 or bpm > 180: bpm = 120
+        print(f"  - BPM: {bpm}")
+        
+        quarter_note_duration = 60.0 / bpm
+
+        # 6. 노트 통합 및 퀀타이즈
+        all_notes = []
+        for t in times_kick: all_notes.append({'time': t, 'type': 'Kick', 'midi': 36})
+        for t in times_snare: all_notes.append({'time': t, 'type': 'Snare', 'midi': 38})
+        for t in times_hh: all_notes.append({'time': t, 'type': 'Hi-hat', 'midi': 42})
+        
+        all_notes.sort(key=lambda x: x['time'])
+
+        # 중복 제거 (너무 가까운 노트 삭제)
+        filtered_notes = []
+        last_time = -1
+        for note_data in all_notes:
+            if note_data['time'] - last_time > 0.05: # 50ms 이내 중복 무시
+                filtered_notes.append(note_data)
+                last_time = note_data['time']
+
+        for note_data in filtered_notes:
+            ql = note_data['time'] / quarter_note_duration
+            quantized_ql = round(ql * 4) / 4.0
+            
+            n = note.Note()
+            n.pitch.midi = note_data['midi']
+            n.quarterLength = 0.25
+            if note_data['type'] == 'Hi-hat': n.notehead = 'x'
+            
+            p.insert(quantized_ql, n)
+
+        p.makeMeasures(inPlace=True)
+        s.append(p)
+        
+        s.write('musicxml', fp=output_xml_path)
+        s.write('midi', fp=output_midi_path)
+
+        print(f"✅ Custom Drum Transcription 완료: {output_xml_path}")
+        return output_midi_path, output_xml_path
 
     except Exception as e:
-        logger.error(f"Transcription failed: {str(e)}")
-        raise Exception(f"트랜스크립션 실패: {str(e)}")
-
-
-async def analyze_audio_metadata(audio_path: str) -> Dict[str, Any]:
-    """
-    오디오 파일 분석 (BPM, 길이 등)
-
-    Args:
-        audio_path: 오디오 파일 경로
-
-    Returns:
-        메타데이터 딕셔너리
-    """
-    try:
-        # librosa로 오디오 로드
-        y, sr = librosa.load(audio_path, sr=None)
-
-        # 길이 계산
-        duration_seconds = librosa.get_duration(y=y, sr=sr)
-        duration_str = f"{int(duration_seconds // 60)}:{int(duration_seconds % 60):02d}"
-
-        # BPM 추정
-        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-        bpm = int(tempo)
-
-        # 난이도 추정 (간단한 휴리스틱)
-        # onset 수로 난이도 추정
-        onset_env = librosa.onset.onset_strength(y=y, sr=sr)
-        onsets = librosa.onset.onset_detect(onset_envelope=onset_env, sr=sr)
-        onset_density = len(onsets) / duration_seconds
-
-        if onset_density > 8:
-            difficulty = "Expert"
-        elif onset_density > 5:
-            difficulty = "Advanced"
-        elif onset_density > 3:
-            difficulty = "Intermediate"
-        else:
-            difficulty = "Beginner"
-
-        return {
-            "duration": duration_str,
-            "bpm": bpm,
-            "difficulty": difficulty,
-        }
-
-    except Exception as e:
-        logger.error(f"Metadata analysis failed: {str(e)}")
-        return {
-            "duration": "0:00",
-            "bpm": 120,
-            "difficulty": "Intermediate",
-        }
+        print(f"❌ Custom Transcription 오류: {e}")
+        return None, None

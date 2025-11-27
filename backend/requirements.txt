@@ -4,7 +4,7 @@ uvicorn[standard]==0.27.0
 python-multipart==0.0.6
 
 # YouTube 다운로드
-yt-dlp==2024.1.7
+yt-dlp
 
 # 음원 분리
 demucs==4.0.1
@@ -15,10 +15,9 @@ soundfile==0.12.1
 
 # 트랜스크립션
 basic-pitch==0.2.5
-tensorflow==2.15.0  # basic-pitch 의존성
-
+tensorflow==2.11.0
 # MIDI/MusicXML 처리
 music21==9.1.0
 
 # 유틸리티
-numpy==1.24.3
+numpy==1.23.5

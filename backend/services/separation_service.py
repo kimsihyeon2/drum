@@ -5,6 +5,7 @@ import os
 import logging
 import subprocess
 import shutil
+import sys
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,7 @@ async def separate_drums(audio_path: str, task_id: str) -> str:
         logger.info(f"Starting Demucs separation for: {audio_path}")
 
         cmd = [
-            "python", "-m", "demucs",
+            sys.executable, "-m", "demucs",
             "--two-stems=drums",  # 드럼만 분리
             "-n", "htdemucs",  # htdemucs 모델 사용
             "-o", TEMP_DIR,
